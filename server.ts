@@ -9,9 +9,11 @@ import { RoomManager } from './src/server/roomManager.ts';
 import { createServer as createViteServer } from 'vite';
 
 const reactionRateLimits = new Map<string, { count: number; lastReset: number }>();
+const chatRateLimits = new Map<string, { count: number; lastReset: number }>();
 
 async function startServer() {
   await initDb();
+  RoomManager.init();
 
   const app = express();
   app.use(cors());
@@ -24,13 +26,27 @@ async function startServer() {
 
   // REST API
   app.post('/api/rooms', async (req, res) => {
-    const { mediaUrl, displayName } = req.body;
-    const roomId = crypto.randomBytes(4).toString('hex');
-    const ownerId = crypto.randomBytes(8).toString('hex');
+    const { mediaUrl, displayName, userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId is required' });
     
-    const initialMedia = mediaUrl ? {
+    const roomId = crypto.randomBytes(4).toString('hex');
+    const ownerId = userId;
+    
+    let sanitizedMediaUrl = mediaUrl;
+    if (sanitizedMediaUrl) {
+      try {
+        const url = new URL(sanitizedMediaUrl);
+        if (!['http:', 'https:'].includes(url.protocol)) {
+          return res.status(400).json({ error: 'Invalid URL protocol' });
+        }
+      } catch(e) {
+        return res.status(400).json({ error: 'Invalid URL' });
+      }
+    }
+
+    const initialMedia = sanitizedMediaUrl ? {
       id: crypto.randomUUID(),
-      url: mediaUrl,
+      url: sanitizedMediaUrl,
       type: 'auto',
       title: 'Video',
       addedBy: ownerId
@@ -62,10 +78,32 @@ async function startServer() {
     }
   });
 
+  // Helper for auth validation based strictly on socket session
+  const getAuth = (socketId: string) => {
+    const info = RoomManager.getUserBySocket(socketId);
+    return info;
+  };
+
+  const checkPermission = (info: any, requireHost: boolean = false) => {
+    if (!info) return false;
+    const { roomId, user } = info;
+    const room = RoomManager.getRoom(roomId);
+    if (!room) return false;
+    
+    if (requireHost) {
+      return user.role === 'owner' || user.role === 'host' || user.role === 'co-host';
+    }
+    
+    if (room.settings.hostOnlyControl) {
+      return user.role === 'owner' || user.role === 'host' || user.role === 'co-host';
+    }
+    
+    return true;
+  };
+
   // Socket.IO
   io.on('connection', (socket) => {
     
-    // Server Clock Sync
     socket.on('ping', (clientTime, callback) => {
       if (typeof callback === 'function') {
         callback(clientTime, Date.now());
@@ -104,137 +142,183 @@ async function startServer() {
       });
     });
 
-    const checkPermission = (roomId: string, userId: string, requireHost: boolean = false) => {
-      const room = RoomManager.getRoom(roomId);
-      if (!room) return false;
-      const members = RoomManager.getRoomMembers(roomId);
-      const user = members.find(m => m.userId === userId);
-      if (!user) return false;
-      
-      if (requireHost) {
-        return user.role === 'owner' || user.role === 'host' || user.role === 'co-host';
-      }
-      
-      if (room.settings.hostOnlyControl) {
-        return user.role === 'owner' || user.role === 'host' || user.role === 'co-host';
-      }
-      
-      return true;
-    };
-
-    // Playback events
-    socket.on('player:play', ({ roomId, userId, position }) => {
-      if (checkPermission(roomId, userId)) {
-        const room = RoomManager.updatePlayback(roomId, 'PLAYING', true, position, 1, Date.now());
-        if (room) io.to(roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+    // Playback events (Auth by socket ID)
+    socket.on('player:play', ({ position }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info)) {
+        const room = RoomManager.updatePlayback(info.roomId, 'PLAYING', true, position, 1, Date.now());
+        if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
       }
     });
 
-    socket.on('player:pause', ({ roomId, userId, position }) => {
-      if (checkPermission(roomId, userId)) {
-        const room = RoomManager.updatePlayback(roomId, 'PAUSED', false, position, 1, Date.now());
-        if (room) io.to(roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+    socket.on('player:pause', ({ position }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info)) {
+        const room = RoomManager.updatePlayback(info.roomId, 'PAUSED', false, position, 1, Date.now());
+        if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
       }
     });
 
-    socket.on('player:seek', ({ roomId, userId, position }) => {
-      if (checkPermission(roomId, userId)) {
-        const r = RoomManager.getRoom(roomId);
-        const room = RoomManager.updatePlayback(roomId, r?.status || 'SEEKING', r?.playing || false, position, r?.playbackRate || 1, Date.now());
-        if (room) io.to(roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+    socket.on('player:seek', ({ position }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info)) {
+        const r = RoomManager.getRoom(info.roomId);
+        const room = RoomManager.updatePlayback(info.roomId, r?.status || 'SEEKING', r?.playing || false, position, r?.playbackRate || 1, Date.now());
+        if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
       }
+    });
+
+    socket.on('player:ended', () => {
+       const info = getAuth(socket.id);
+       if (checkPermission(info)) {
+         const room = RoomManager.handleMediaEnded(info.roomId);
+         if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+       }
     });
 
     // Queue events
-    socket.on('queue:add', ({ roomId, userId, media }) => {
-      const r = RoomManager.getRoom(roomId);
-      if (r && (checkPermission(roomId, userId) || r.settings.allowViewerQueue)) {
-        const mediaItem = { ...media, id: crypto.randomUUID(), addedBy: userId };
-        const room = RoomManager.addMedia(roomId, mediaItem);
-        if (room) io.to(roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
-      }
-    });
+    socket.on('queue:add', ({ media }) => {
+      const info = getAuth(socket.id);
+      if (!info) return;
+      const r = RoomManager.getRoom(info.roomId);
+      if (r && (checkPermission(info) || r.settings.allowViewerQueue)) {
+        try {
+          const url = new URL(media.url);
+          if (['http:', 'https:'].includes(url.protocol)) {
+            
+            if (url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be')) {
+               socket.emit('error', 'YouTube playback requires a specialized embed player (Not currently supported).');
+               return;
+            }
+            if (url.hostname.includes('tiktok.com') || url.hostname.includes('instagram.com')) {
+               socket.emit('error', 'This platform restricts direct video playback.');
+               return;
+            }
 
-    socket.on('queue:remove', ({ roomId, userId, index }) => {
-      if (checkPermission(roomId, userId)) {
-        const room = RoomManager.removeMedia(roomId, index);
-        if (room) io.to(roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
-      }
-    });
+            const title = media.title !== 'Video' ? media.title : (url.pathname.split('/').pop() || 'Media Track');
+            const type = url.pathname.includes('.m3u8') ? 'hls' : 'auto';
 
-    socket.on('queue:next', ({ roomId, userId }) => {
-      if (checkPermission(roomId, userId)) {
-        const room = RoomManager.playNext(roomId);
-        if (room) io.to(roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
-      }
-    });
-
-    socket.on('queue:previous', ({ roomId, userId, currentPosition }) => {
-      if (checkPermission(roomId, userId)) {
-        const room = RoomManager.playPrevious(roomId, currentPosition);
-        if (room) io.to(roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
-      }
-    });
-
-    socket.on('room:settings', ({ roomId, userId, settings }) => {
-      if (checkPermission(roomId, userId, true)) { // Must be host/owner
-        const room = RoomManager.updateSettings(roomId, settings);
-        if (room) io.to(roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
-      }
-    });
-
-    // Moderation
-    socket.on('mod:kick', ({ roomId, userId, targetUserId }) => {
-      if (checkPermission(roomId, userId, true)) {
-        const members = RoomManager.getRoomMembers(roomId);
-        const target = members.find(m => m.userId === targetUserId);
-        if (target && target.role !== 'owner') {
-          RoomManager.leaveRoom(roomId, targetUserId);
-          io.to(target.socketId).emit('error', 'You have been kicked from the room');
-          io.to(target.socketId).disconnectSockets(true);
-          io.to(roomId).emit('participant:update', RoomManager.getRoomMembers(roomId));
+            const mediaItem = { ...media, url: url.toString(), id: crypto.randomUUID(), addedBy: info.user.userId, title, type };
+            const room = RoomManager.addMedia(info.roomId, mediaItem);
+            if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+          } else {
+             socket.emit('error', 'Invalid URL protocol.');
+          }
+        } catch(e) {
+             socket.emit('error', 'Invalid URL.');
         }
       }
     });
 
-    socket.on('mod:ban', ({ roomId, userId, targetUserId }) => {
-      if (checkPermission(roomId, userId, true)) {
-        RoomManager.banUser(roomId, targetUserId);
-        io.to(roomId).emit('participant:update', RoomManager.getRoomMembers(roomId));
+    socket.on('queue:remove', ({ index }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info)) {
+        const room = RoomManager.removeMedia(info.roomId, index);
+        if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+      }
+    });
+
+    socket.on('queue:next', () => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info)) {
+        const room = RoomManager.playNext(info.roomId);
+        if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+      }
+    });
+
+    socket.on('queue:previous', ({ currentPosition }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info)) {
+        const room = RoomManager.playPrevious(info.roomId, currentPosition);
+        if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+      }
+    });
+
+    socket.on('room:settings', ({ settings }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info, true)) {
+        const room = RoomManager.updateSettings(info.roomId, settings);
+        if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+      }
+    });
+
+    // Moderation
+    socket.on('mod:kick', ({ targetUserId }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info, true)) {
+        const members = RoomManager.getRoomMembers(info.roomId);
+        const target = members.find(m => m.userId === targetUserId);
+        if (target && target.role !== 'owner') {
+          RoomManager.leaveRoom(info.roomId, targetUserId);
+          io.to(target.socketId).emit('error', 'You have been kicked from the room');
+          io.sockets.sockets.get(target.socketId)?.disconnect(true);
+          io.to(info.roomId).emit('participant:update', RoomManager.getRoomMembers(info.roomId));
+        }
+      }
+    });
+
+    socket.on('mod:ban', ({ targetUserId }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info, true)) {
+        const room = RoomManager.banUser(info.roomId, targetUserId);
+        if (room) {
+           io.to(info.roomId).emit('participant:update', RoomManager.getRoomMembers(info.roomId));
+           for (const [id, socketInstance] of io.sockets.sockets) {
+              const checkInfo = RoomManager.getUserBySocket(id);
+              if (checkInfo && checkInfo.user.userId === targetUserId) {
+                 socketInstance.emit('error', 'You have been banned from this room');
+                 socketInstance.disconnect(true);
+              }
+           }
+        }
       }
     });
 
     // Social
-    socket.on('chat:message', ({ roomId, userId, text, mediaPosition }) => {
-      const room = RoomManager.getRoom(roomId);
-      if (room && !room.settings.allowChat && !checkPermission(roomId, userId, true)) return;
+    socket.on('chat:message', ({ text, mediaPosition }) => {
+      const info = getAuth(socket.id);
+      if (!info) return;
+      
+      const now = Date.now();
+      let limit = chatRateLimits.get(info.user.userId);
+      if (!limit || now - limit.lastReset > 2000) {
+         limit = { count: 0, lastReset: now };
+      }
+      if (limit.count > 5) return;
+      limit.count++;
+      chatRateLimits.set(info.user.userId, limit);
 
-      const members = RoomManager.getRoomMembers(roomId);
-      const user = members.find(m => m.userId === userId);
-      if (user && !user.isMuted) {
-        io.to(roomId).emit('chat:message', {
+      const room = RoomManager.getRoom(info.roomId);
+      if (room && !room.settings.allowChat && !checkPermission(info, true)) return;
+
+      if (!info.user.isMuted) {
+        const sanitizedText = text.substring(0, 500).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        io.to(info.roomId).emit('chat:message', {
           id: crypto.randomUUID(),
           type: 'user',
-          userId,
-          displayName: user.displayName,
-          text,
+          userId: info.user.userId,
+          displayName: info.user.displayName,
+          text: sanitizedText,
           timestamp: Date.now(),
           mediaPosition
         });
       }
     });
 
-    socket.on('reaction:send', ({ roomId, userId, reaction }) => {
+    socket.on('reaction:send', ({ reaction }) => {
+      const info = getAuth(socket.id);
+      if (!info) return;
+
       const now = Date.now();
-      let limit = reactionRateLimits.get(userId);
+      let limit = reactionRateLimits.get(info.user.userId);
       if (!limit || now - limit.lastReset > 1000) {
         limit = { count: 0, lastReset: now };
       }
       
       if (limit.count < 5) {
         limit.count++;
-        reactionRateLimits.set(userId, limit);
-        io.to(roomId).emit('reaction:broadcast', { reaction, userId, id: crypto.randomUUID() });
+        reactionRateLimits.set(info.user.userId, limit);
+        io.to(info.roomId).emit('reaction:broadcast', { reaction, userId: info.user.userId, id: crypto.randomUUID() });
       }
     });
 
@@ -247,34 +331,18 @@ async function startServer() {
     });
 
     socket.on('disconnect', () => {
-      const info = RoomManager.getUserBySocket(socket.id);
+      const info = RoomManager.handleDisconnect(socket.id);
       if (info) {
-        info.user.status = 'offline';
-        // Delay leave to allow reconnect
-        setTimeout(() => {
-          const check = RoomManager.getUserBySocket(info.user.socketId);
-          if (check && check.user.status === 'offline') {
-            const members = RoomManager.leaveRoom(info.roomId, info.user.userId);
-            io.to(info.roomId).emit('participant:update', members);
-            io.to(info.roomId).emit('chat:message', {
-              id: crypto.randomUUID(),
-              type: 'system',
-              text: `${info.user.displayName} left the room`,
-              timestamp: Date.now()
-            });
-          }
-        }, 10000); // 10s grace period for reconnect
+        io.to(info.roomId).emit('participant:update', RoomManager.getRoomMembers(info.roomId));
       }
     });
   });
 
   // Periodic Authoritative Sync (Heartbeat to all rooms)
   setInterval(() => {
-    const now = Date.now();
     io.sockets.adapter.rooms.forEach((_, roomId) => {
       const room = RoomManager.getRoom(roomId);
-      if (room && room.playing) {
-         // Auto play next if ended (simple fallback check)
+      if (room) {
          io.to(roomId).emit('room:heartbeat', {
            sequence: room.sequence,
            playing: room.playing,

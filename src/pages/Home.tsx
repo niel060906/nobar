@@ -38,18 +38,17 @@ export default function Home() {
     e.preventDefault();
     if (!displayName.trim()) return toast.error('Display name is required');
     
+    const userId = localStorage.getItem('watchparty_id') || crypto.randomUUID();
+    localStorage.setItem('watchparty_name', displayName);
+    localStorage.setItem('watchparty_id', userId);
+    
     try {
       const res = await fetch('/api/rooms', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mediaUrl, displayName })
+        body: JSON.stringify({ mediaUrl, displayName, userId })
       });
       const data = await res.json();
-      
-      // Store user identity
-      localStorage.setItem('watchparty_name', displayName);
-      localStorage.setItem(`watchparty_role_${data.roomId}`, 'host');
-      localStorage.setItem(`watchparty_id`, localStorage.getItem('watchparty_id') || crypto.randomUUID());
       
       navigate(`/room/${data.roomId}`);
     } catch (err) {

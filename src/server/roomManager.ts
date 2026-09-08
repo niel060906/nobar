@@ -1,13 +1,61 @@
 import { db } from './db.ts';
 import { RoomState, UserState, MediaItem, RoomSettings, RoomStatus, UserRole } from '../types/index.ts';
-import crypto from 'crypto';
 
 const activeRooms = new Map<string, RoomState>();
 const roomMembers = new Map<string, Map<string, UserState>>();
 
-const HOST_GRACE_PERIOD_MS = 20000; // 20 seconds
+const HOST_GRACE_PERIOD_MS = 20000;
 
 export const RoomManager = {
+  init() {
+    try {
+      const rooms = db.prepare('SELECT * FROM rooms').all() as any[];
+      for (const r of rooms) {
+        activeRooms.set(r.id, {
+          roomId: r.id,
+          status: r.status,
+          sequence: r.sequence,
+          ownerId: r.ownerId,
+          hostId: r.hostId,
+          queue: r.queue ? JSON.parse(r.queue) : [],
+          currentMediaIndex: r.currentMediaIndex,
+          playing: false, // Reset playing state on server restart
+          position: r.position,
+          playbackRate: 1,
+          updatedAt: Date.now(),
+          settings: r.settings ? JSON.parse(r.settings) : {},
+          bannedUsers: []
+        });
+        roomMembers.set(r.id, new Map());
+        
+        try {
+          const banned = db.prepare('SELECT userId FROM banned_users WHERE roomId = ?').all(r.id) as any[];
+          activeRooms.get(r.id)!.bannedUsers = banned.map(b => b.userId);
+        } catch (e) {}
+      }
+      console.log(`Loaded ${rooms.length} rooms from database.`);
+    } catch (e) {
+      console.error("Failed to initialize RoomManager from DB", e);
+    }
+  },
+
+  persistRoom(room: RoomState) {
+    try {
+      db.prepare(`
+        UPDATE rooms SET 
+          hostId = ?, status = ?, sequence = ?, queue = ?, currentMediaIndex = ?, 
+          playing = ?, position = ?, playbackRate = ?, updatedAt = ?, settings = ?
+        WHERE id = ?
+      `).run(
+        room.hostId, room.status, room.sequence, JSON.stringify(room.queue), room.currentMediaIndex,
+        room.playing ? 1 : 0, room.position, room.playbackRate, room.updatedAt, JSON.stringify(room.settings),
+        room.roomId
+      );
+    } catch (e) {
+      console.error("Failed to persist room", e);
+    }
+  },
+
   createRoom(roomId: string, ownerId: string, initialMedia: MediaItem | null, displayName: string): RoomState {
     const defaultSettings: RoomSettings = {
       hostOnlyControl: true,
@@ -40,9 +88,13 @@ export const RoomManager = {
     activeRooms.set(roomId, state);
     roomMembers.set(roomId, new Map());
     
-    db.prepare('INSERT INTO rooms (id, ownerId, hostId, queue, updatedAt, settings) VALUES (?, ?, ?, ?, ?, ?)').run(
-      roomId, ownerId, ownerId, JSON.stringify(queue), state.updatedAt, JSON.stringify(defaultSettings)
-    );
+    try {
+      db.prepare('INSERT INTO rooms (id, ownerId, hostId, queue, updatedAt, settings) VALUES (?, ?, ?, ?, ?, ?)').run(
+        roomId, ownerId, ownerId, JSON.stringify(queue), state.updatedAt, JSON.stringify(defaultSettings)
+      );
+    } catch (e) {
+      console.error("Failed to insert room to DB", e);
+    }
 
     return state;
   },
@@ -68,6 +120,7 @@ export const RoomManager = {
       room.playbackRate = rate;
       room.updatedAt = serverTime;
       this.incrementSequence(room);
+      this.persistRoom(room);
     }
     return room;
   },
@@ -81,6 +134,7 @@ export const RoomManager = {
         room.status = 'READY';
       }
       this.incrementSequence(room);
+      this.persistRoom(room);
     }
     return room;
   },
@@ -90,7 +144,6 @@ export const RoomManager = {
     if (room && index >= 0 && index < room.queue.length) {
       room.queue.splice(index, 1);
       if (room.currentMediaIndex === index) {
-        // If removing current, play next or stop
         if (room.queue.length > 0) {
           room.currentMediaIndex = Math.min(index, room.queue.length - 1);
           room.position = 0;
@@ -105,44 +158,61 @@ export const RoomManager = {
         room.currentMediaIndex--;
       }
       this.incrementSequence(room);
+      this.persistRoom(room);
     }
     return room;
   },
 
-  playNext(roomId: string) {
+  handleMediaEnded(roomId: string) {
     const room = activeRooms.get(roomId);
-    if (room && room.queue.length > 0) {
+    if (!room) return null;
+    
+    // Transition lock (2 seconds) to prevent duplicate ended events
+    if (Date.now() - room.updatedAt < 2000) return null;
+
+    if (room.queue.length > 0) {
       if (room.settings.repeatMode === 'current') {
         room.position = 0;
       } else {
-        if (room.currentMediaIndex < room.queue.length - 1) {
+        if (room.settings.shuffle) {
+           let nextIdx = Math.floor(Math.random() * room.queue.length);
+           if (nextIdx === room.currentMediaIndex && room.queue.length > 1) {
+             nextIdx = (nextIdx + 1) % room.queue.length;
+           }
+           room.currentMediaIndex = nextIdx;
+        } else if (room.currentMediaIndex < room.queue.length - 1) {
           room.currentMediaIndex++;
         } else if (room.settings.repeatMode === 'queue') {
           room.currentMediaIndex = 0;
         } else {
           room.status = 'ENDED';
           room.playing = false;
+          room.updatedAt = Date.now();
           this.incrementSequence(room);
+          this.persistRoom(room);
           return room;
         }
       }
       room.position = 0;
       room.updatedAt = Date.now();
       room.status = 'READY';
-      // Automatically play next if setting is on
       if (room.settings.autoPlayNext) {
         room.playing = true;
       }
       this.incrementSequence(room);
+      this.persistRoom(room);
     }
     return room;
+  },
+
+  playNext(roomId: string) {
+    return this.handleMediaEnded(roomId);
   },
 
   playPrevious(roomId: string, currentPosition: number) {
     const room = activeRooms.get(roomId);
     if (room && room.queue.length > 0) {
       if (currentPosition > 5) {
-        // Restart current
         room.position = 0;
       } else {
         if (room.currentMediaIndex > 0) {
@@ -155,6 +225,7 @@ export const RoomManager = {
       room.updatedAt = Date.now();
       room.status = 'READY';
       this.incrementSequence(room);
+      this.persistRoom(room);
     }
     return room;
   },
@@ -164,6 +235,7 @@ export const RoomManager = {
     if (room) {
       room.settings = { ...room.settings, ...settings };
       this.incrementSequence(room);
+      this.persistRoom(room);
     }
     return room;
   },
@@ -182,6 +254,10 @@ export const RoomManager = {
     let role: UserRole = 'viewer';
     if (room.ownerId === userId) {
       role = 'owner';
+      if (!room.hostId) {
+        room.hostId = userId;
+        this.persistRoom(room);
+      }
     } else if (room.hostId === userId) {
       role = 'host';
     }
@@ -197,6 +273,15 @@ export const RoomManager = {
     };
     
     members.set(userId, user);
+    
+    try {
+      db.prepare(`
+        INSERT INTO room_members (roomId, userId, displayName, role, joinedAt, lastSeen, status, isMuted) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(roomId, userId) DO UPDATE SET socketId = excluded.socketId, status = 'online', lastSeen = excluded.lastSeen
+      `).run(roomId, userId, displayName, role, Date.now(), Date.now(), 'online', 0);
+    } catch (e) {}
+
     return user;
   },
 
@@ -207,34 +292,50 @@ export const RoomManager = {
       if (user) {
         user.status = 'offline';
         user.lastSeen = Date.now();
-        
-        // Host takeover logic
-        const room = activeRooms.get(roomId);
-        if (room && room.hostId === userId && room.ownerId !== userId) {
-           this.checkHostTakeover(roomId);
-        }
       }
     }
     return this.getRoomMembers(roomId);
   },
 
+  handleDisconnect(socketId: string) {
+    const info = this.getUserBySocket(socketId);
+    if (info) {
+      info.user.status = 'offline';
+      info.user.lastSeen = Date.now();
+      
+      // Delay host takeover evaluation
+      setTimeout(() => {
+        const currentMembers = roomMembers.get(info.roomId);
+        if (currentMembers) {
+          const userNow = currentMembers.get(info.user.userId);
+          if (userNow && userNow.status === 'offline') {
+            const room = activeRooms.get(info.roomId);
+            if (room && room.hostId === info.user.userId) {
+              const updatedRoom = this.checkHostTakeover(info.roomId);
+              if (updatedRoom) {
+                 // Trigger something if needed, handled by periodic sync/heartbeat usually.
+              }
+            }
+          }
+        }
+      }, HOST_GRACE_PERIOD_MS);
+      
+      return info;
+    }
+    return null;
+  },
+
   checkHostTakeover(roomId: string) {
     const members = this.getRoomMembers(roomId);
     const room = activeRooms.get(roomId);
-    if (!room) return;
+    if (!room) return null;
 
-    // Filter online users
     const onlineUsers = members.filter(m => m.status === 'online');
-    if (onlineUsers.length === 0) return;
+    if (onlineUsers.length === 0) return null;
 
-    // Determine new host priority: 1. Owner 2. Co-host 3. Longest connected
     let newHost = onlineUsers.find(m => m.role === 'owner');
-    if (!newHost) {
-      newHost = onlineUsers.find(m => m.role === 'co-host');
-    }
-    if (!newHost) {
-      newHost = onlineUsers.sort((a, b) => a.lastSeen - b.lastSeen)[0];
-    }
+    if (!newHost) newHost = onlineUsers.find(m => m.role === 'co-host');
+    if (!newHost) newHost = onlineUsers.sort((a, b) => a.lastSeen - b.lastSeen)[0];
 
     if (newHost && newHost.userId !== room.hostId) {
       room.hostId = newHost.userId;
@@ -244,26 +345,41 @@ export const RoomManager = {
         if (h && h.role === 'viewer') h.role = 'host';
       }
       this.incrementSequence(room);
+      this.persistRoom(room);
+      return room;
     }
+    return null;
   },
 
   changeRole(roomId: string, targetUserId: string, role: UserRole) {
     const members = roomMembers.get(roomId);
-    if (members) {
+    const room = activeRooms.get(roomId);
+    if (members && room) {
       const user = members.get(targetUserId);
       if (user && user.role !== 'owner') {
         user.role = role;
+        if (role === 'host') {
+           room.hostId = targetUserId;
+           this.persistRoom(room);
+        }
       }
     }
   },
 
   banUser(roomId: string, targetUserId: string) {
     const room = activeRooms.get(roomId);
-    if (room) {
-      room.bannedUsers.push(targetUserId);
+    if (room && targetUserId !== room.ownerId) {
+      if (!room.bannedUsers.includes(targetUserId)) {
+         room.bannedUsers.push(targetUserId);
+      }
       const members = roomMembers.get(roomId);
       if (members) members.delete(targetUserId);
+      
+      try {
+        db.prepare('INSERT OR IGNORE INTO banned_users (roomId, userId, bannedAt) VALUES (?, ?, ?)').run(roomId, targetUserId, Date.now());
+      } catch (e) {}
     }
+    return room;
   },
 
   getRoomMembers(roomId: string) {

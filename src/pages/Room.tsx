@@ -110,20 +110,19 @@ export default function Room() {
   const canControl = store.canControlPlayback();
 
   const handlePlay = (pos: number) => {
-    socketRef.current?.emit('player:play', { roomId, userId, position: pos });
+    socketRef.current?.emit('player:play', { position: pos });
   };
 
   const handlePause = (pos: number) => {
-    socketRef.current?.emit('player:pause', { roomId, userId, position: pos });
+    socketRef.current?.emit('player:pause', { position: pos });
   };
 
   const handleSeek = (pos: number) => {
-    socketRef.current?.emit('player:seek', { roomId, userId, position: pos });
+    socketRef.current?.emit('player:seek', { position: pos });
   };
 
   const handleRateChange = (rate: number) => {
-    // We don't broadcast small drift corrections, only UI rate changes 
-    // The player wrapper handles limiting
+    // Only handled locally for small drifts, unless we want to broadcast explicitly.
   };
 
   const addMediaToQueue = (e: React.FormEvent) => {
@@ -131,7 +130,6 @@ export default function Room() {
     if (!mediaUrlInput.trim()) return;
     
     socketRef.current?.emit('queue:add', { 
-      roomId, userId, 
       media: { url: mediaUrlInput, type: 'auto', title: 'Video' } 
     });
     setMediaUrlInput('');
