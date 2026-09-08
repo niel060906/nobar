@@ -1,3 +1,4 @@
+import React from 'react';
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router';
 import { Video, Users, Play, LogIn, MonitorPlay } from 'lucide-react';

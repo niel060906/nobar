@@ -24,6 +24,17 @@ async function startServer() {
     cors: { origin: '*', methods: ['GET', 'POST'] }
   });
 
+  // Memory leak cleanup for rate limit maps
+  setInterval(() => {
+    const now = Date.now();
+    for (const [userId, limit] of reactionRateLimits.entries()) {
+      if (now - limit.lastReset > 60000) reactionRateLimits.delete(userId);
+    }
+    for (const [userId, limit] of chatRateLimits.entries()) {
+      if (now - limit.lastReset > 60000) chatRateLimits.delete(userId);
+    }
+  }, 60000);
+
   // REST API
   app.post('/api/rooms', async (req, res) => {
     const { mediaUrl, displayName, userId } = req.body;
@@ -146,7 +157,8 @@ async function startServer() {
     socket.on('player:play', ({ position }) => {
       const info = getAuth(socket.id);
       if (checkPermission(info)) {
-        const room = RoomManager.updatePlayback(info.roomId, 'PLAYING', true, position, 1, Date.now());
+        const r = RoomManager.getRoom(info.roomId);
+        const room = RoomManager.updatePlayback(info.roomId, 'PLAYING', true, position, r?.playbackRate || 1, Date.now());
         if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
       }
     });
@@ -154,7 +166,8 @@ async function startServer() {
     socket.on('player:pause', ({ position }) => {
       const info = getAuth(socket.id);
       if (checkPermission(info)) {
-        const room = RoomManager.updatePlayback(info.roomId, 'PAUSED', false, position, 1, Date.now());
+        const r = RoomManager.getRoom(info.roomId);
+        const room = RoomManager.updatePlayback(info.roomId, 'PAUSED', false, position, r?.playbackRate || 1, Date.now());
         if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
       }
     });
@@ -164,6 +177,15 @@ async function startServer() {
       if (checkPermission(info)) {
         const r = RoomManager.getRoom(info.roomId);
         const room = RoomManager.updatePlayback(info.roomId, r?.status || 'SEEKING', r?.playing || false, position, r?.playbackRate || 1, Date.now());
+        if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
+      }
+    });
+
+    socket.on('player:rate', ({ rate, position }) => {
+      const info = getAuth(socket.id);
+      if (checkPermission(info)) {
+        const r = RoomManager.getRoom(info.roomId);
+        const room = RoomManager.updatePlayback(info.roomId, r?.status || 'PLAYING', r?.playing || false, position, rate, Date.now());
         if (room) io.to(info.roomId).emit('room:sync', { roomState: room, serverTime: Date.now() });
       }
     });
@@ -271,6 +293,14 @@ async function startServer() {
               }
            }
         }
+      }
+    });
+
+    socket.on('mod:role', ({ targetUserId, role }) => {
+      const info = getAuth(socket.id);
+      if (info && info.user.role === 'owner') {
+        RoomManager.changeRole(info.roomId, targetUserId, role);
+        io.to(info.roomId).emit('participant:update', RoomManager.getRoomMembers(info.roomId));
       }
     });
 

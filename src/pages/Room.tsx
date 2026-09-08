@@ -1,3 +1,4 @@
+import React from 'react';
 import { useEffect, useState, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router';
 import { io, Socket } from 'socket.io-client';
@@ -122,7 +123,7 @@ export default function Room() {
   };
 
   const handleRateChange = (rate: number) => {
-    // Only handled locally for small drifts, unless we want to broadcast explicitly.
+    socketRef.current?.emit('player:rate', { rate, position: videoPosRef.current });
   };
 
   const addMediaToQueue = (e: React.FormEvent) => {

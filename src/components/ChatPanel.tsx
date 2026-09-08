@@ -1,3 +1,4 @@
+import React from 'react';
 import { useRoomStore } from '../stores/useRoomStore';
 import { Send, Clock } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
