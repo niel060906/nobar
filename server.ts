@@ -1,3 +1,4 @@
+console.log("Starting server.ts... please wait!");
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
@@ -405,4 +406,4 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch(err => { console.error("FATAL ERROR ON STARTUP:", err); process.exit(1); });
